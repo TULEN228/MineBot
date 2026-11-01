@@ -1,8 +1,12 @@
 
 import os
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from contextlib import asynccontextmanager
 
+import asyncpg
+from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -11,58 +15,65 @@ from telegram.ext import (
 )
 
 # Настройки
-TOKEN = os.getenv("9072460110:AAET_MCz6Wpn5qZ8zgP3Aey6_T7YZPoO3kM")
-OWNER_ID = int(os.getenv("6958726014"))
-GROUP_ID = int(os.getenv("-1004445854725"))
+TOKEN = os.environ["BOT_TOKEN"]
+OWNER_ID = int(os.environ["OWNER_ID"])
+GROUP_ID = int(os.environ["GROUP_ID"])
+WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
+DATABASE_URL = os.environ["DATABASE_URL"]
 
-STATE_FILE = os.getenv("STATE_FILE", "status.txt")
+logging.basicConfig(level=logging.INFO)
 
-
-# Получение состояния сервера
-def get_status():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as file:
-            return file.read().strip()
-
-    return "off"
+telegram_app = Application.builder().token(TOKEN).build()
+db = None
 
 
-# Сохранение состояния
-def save_status(status):
-    with open(STATE_FILE, "w") as file:
-        file.write(status)
+# Получение и сохранение статуса через базу данных
+async def get_status():
+    result = await db.fetchval(
+        "SELECT value FROM bot_state WHERE key = 'server_status'"
+    )
+    return result or "off"
 
 
-# Команды владельца: /on и /off
+async def save_status(status):
+    await db.execute(
+        """
+        INSERT INTO bot_state (key, value)
+        VALUES ('server_status', $1)
+        ON CONFLICT (key)
+        DO UPDATE SET value = EXCLUDED.value
+        """,
+        status
+    )
+
+
+# Команды владельца
 async def set_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
 
-    # Только владелец в личных сообщениях
     if chat.type != "private" or user.id != OWNER_ID:
         return
 
     command = update.message.text.split()[0].split("@")[0]
 
     if command == "/on":
-        save_status("on")
-        await update.message.reply_text(
-            "🟢 Сервер включён!"
-        )
+        await save_status("on")
+        await update.message.reply_text("🟢 Сервер включён!")
 
     elif command == "/off":
-        save_status("off")
-        await update.message.reply_text(
-            "🔴 Сервер выключен!"
-        )
+        await save_status("off")
+        await update.message.reply_text("🔴 Сервер выключен!")
 
 
-# Команда /status в группе
+# Проверка статуса в группе
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != GROUP_ID:
         return
 
-    if get_status() == "on":
+    current = await get_status()
+
+    if current == "on":
         message = "🟢 Сервер включён!"
     else:
         message = "🔴 Сервер выключен!"
@@ -70,7 +81,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message)
 
 
-# Команда /alert в группе
+# Запрос на включение сервера
 async def alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != GROUP_ID:
         return
@@ -82,15 +93,16 @@ async def alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         name = user.full_name
 
-    time = datetime.now(ZoneInfo("Asia/Tashkent"))
-    formatted_time = time.strftime("%H:%M")
+    time = datetime.now(
+        ZoneInfo("Asia/Tashkent")
+    ).strftime("%H:%M")
 
     await context.bot.send_message(
         chat_id=OWNER_ID,
         text=(
             "⚠️ Запрос на включение сервера!\n\n"
             f"👤 Пользователь: {name}\n"
-            f"🕒 Время: {formatted_time}"
+            f"🕒 Время: {time}"
         )
     )
 
@@ -99,18 +111,74 @@ async def alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# Запуск бота
-def main():
-    app = Application.builder().token(TOKEN).build()
+# Запуск Telegram-обработчиков
+telegram_app.add_handler(
+    CommandHandler(["on", "off"], set_status)
+)
+telegram_app.add_handler(
+    CommandHandler("status", status)
+)
+telegram_app.add_handler(
+    CommandHandler("alert", alert)
+)
 
-    app.add_handler(CommandHandler(["on", "off"], set_status))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("alert", alert))
 
-    print("Bot started!")
+# Запуск веб-сервера и Telegram-приложения
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db
 
-    app.run_polling()
+    db = await asyncpg.create_pool(DATABASE_URL)
+
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+
+    await db.execute("""
+        INSERT INTO bot_state (key, value)
+        VALUES ('server_status', 'off')
+        ON CONFLICT (key) DO NOTHING
+    """)
+
+    await telegram_app.initialize()
+    await telegram_app.start()
+
+    logging.info("Telegram bot started!")
+
+    yield
+
+    await telegram_app.stop()
+    await telegram_app.shutdown()
+    await db.close()
 
 
-if __name__ == "__main__":
-    main()
+app = FastAPI(lifespan=lifespan)
+
+
+# Проверка работы сайта
+@app.get("/")
+async def home():
+    return {"status": "Bot is running!"}
+
+
+# Webhook Telegram
+@app.post("/telegram")
+async def telegram_webhook(request: Request):
+
+    secret = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token"
+    )
+
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    data = await request.json()
+
+    update = Update.de_json(data, telegram_app.bot)
+
+    await telegram_app.process_update(update)
+
+    return {"ok": True}
